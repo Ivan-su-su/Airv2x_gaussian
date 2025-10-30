@@ -231,7 +231,9 @@ class GaussianBackbone3D(nn.Module):
         self.mask_head = spconv.SubMConv3d(self.hidden_dim, 1, kernel_size=1)
 
         # Param Head - 只在选中的voxel计算
-        out_dim = 3 + 3 + 4 + self.num_features
+        # 输出: [scale(3) + rotation(4) + features(num_features)]
+        # 注意：不再预测 μ_offset，μ直接使用voxel的真实坐标
+        out_dim = 3 + 4 + self.num_features
         self.param_head = spconv.SubMConv3d(self.hidden_dim, out_dim, kernel_size=1)
         
         # 可选：可学习的尺度偏置
@@ -325,13 +327,13 @@ class GaussianBackbone3D(nn.Module):
             params = torch.where(torch.isnan(params), torch.zeros_like(params), params)
 
         # 解析参数并约束范围
-        μ_offset = params[:, :3]
-        s_param = torch.clamp(F.softplus(params[:, 3:6] + self.scale_bias), min=0.05, max=1.5)
-        r_param = F.normalize(params[:, 6:10] + 1e-6)
-        Q_param = params[:, 10:]
+        # params: [K, 3+4+num_features] = [scale(3) + rotation(4) + features]
+        s_param = torch.clamp(F.softplus(params[:, :3] + self.scale_bias), min=0.05, max=1.5)
+        r_param = F.normalize(params[:, 3:7] + 1e-6)
+        Q_param = params[:, 7:]
 
         # 计算 μ 世界坐标
-        μ_world = self._coords_to_world(sel_coords, μ_offset)
+        μ_world = self._coords_to_world_no_offset(sel_coords)
 
         # step 5: 组织输出
         gaussians = {
@@ -373,13 +375,27 @@ class GaussianBackbone3D(nn.Module):
         将 (batch, z, y, x) voxel 索引 + 偏移 转换为真实世界坐标
         固定 TPV 顺序：world_x ↔ W维度, world_y ↔ H维度, world_z ↔ Z维度
         """
-        device = μ_offset.device
         # voxel_coords: [N, 4] = [batch, z, y, x]
         # 映射：x → W维度, y → H维度, z → Z维度
         world_x = voxel_coords[:, 3].float() * self.voxel_size[0] + self.point_cloud_range[0] + μ_offset[:, 0]  # W方向
         world_y = voxel_coords[:, 2].float() * self.voxel_size[1] + self.point_cloud_range[1] + μ_offset[:, 1]  # H方向
         world_z = voxel_coords[:, 1].float() * self.voxel_size[2] + self.point_cloud_range[2] + μ_offset[:, 2]  # Z方向
         return torch.stack([world_x, world_y, world_z], dim=-1)  # [K,3]
+
+    def _coords_to_world_no_offset(self, voxel_coords):
+        """
+        将 (batch, z, y, x) voxel 索引转换为真实世界坐标（无偏移）
+        
+        Args:
+            voxel_coords: [N, 4] = [batch, z, y, x]
+        Returns:
+            μ_world: [N, 3] (x, y, z) 世界坐标
+        """
+        # 映射：x → W维度, y → H维度, z → Z维度
+        world_x = voxel_coords[:, 3].float() * self.voxel_size[0] + self.point_cloud_range[0]  # W方向
+        world_y = voxel_coords[:, 2].float() * self.voxel_size[1] + self.point_cloud_range[1]  # H方向
+        world_z = voxel_coords[:, 1].float() * self.voxel_size[2] + self.point_cloud_range[2]  # Z方向
+        return torch.stack([world_x, world_y, world_z], dim=-1)  # [N,3]
 
     def _project_to_plane_optimized(self, voxel_features, voxel_coords, plane_type, device, batch_size):
         """
