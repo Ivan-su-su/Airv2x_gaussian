@@ -1369,3 +1369,128 @@ if __name__ == "__main__":
     assert torch.isfinite(out).all(), "Output contains NaNs or Infs"
     print("Smoke test passed:", out.shape)
 
+
+############################################################
+# 文档说明（对外接口 / 配置 / 模块输入输出与形状）
+############################################################
+
+# 1) 整体文件对外接口
+# ----------------------------------------------------------
+# 类: GaussianTPVRefiner(nn.Module)
+# 主要入口: GaussianTPVRefiner.forward(img_gaussians, lidar_gaussians, tpv_features) -> Dict
+# - 输入:
+#   img_gaussians: {
+#       'mu':        [N_img, 3],
+#       'scale':     [N_img, 3],
+#       'rotation':  [N_img, 4],
+#       'features':  [N_img, feature_dim]
+#   }
+#   lidar_gaussians: 与 img_gaussians 同结构（N_lidar 条）
+#   tpv_features: {
+#       'xy': [B, C_tpv, H_xy, W_xy],  约定: [B, 128, 704, 256]
+#       'xz': [B, C_tpv, H_xz, W_xz],  约定: [B, 128, 256,  32]
+#       'yz': [B, C_tpv, H_yz, W_yz],  约定: [B, 128, 704,  32]
+#   }
+# - 输出(更新后的高斯字典，原地更新以节省显存):
+#   {
+#       'mu':       [N, 3],
+#       'scale':    [N, 3],
+#       'rotation': [N, 4],
+#       'features': [N, embed_dims]
+#   }
+# 备注:
+# - 当前 pipeline 假定 B == 1（在 GaussianTPVRefiner.forward 中有断言）。
+# - TPV 三平面分别独立参与 cross-attention（不跨层采样）。
+
+# 2) 各模块需要的 config 配置
+# ----------------------------------------------------------
+# GaussianTPVRefiner(
+#   feature_dim=128,            # 输入高斯特征维度（img/lidar）
+#   tpv_feature_dim=128,        # TPV 平面通道数（与上方 C_tpv 一致）
+#   embed_dims=256,             # 统一工作维度
+#   num_heads=8,                # 多头注意力头数
+#   num_layers=1,               # 预留（当前未堆叠 encoder 层）
+#   k_neighbors=16,             # 稀疏 self-attn 的 kNN 数
+#   pc_range=[x_min,y_min,z_min,x_max,y_max,z_max],
+#   num_points=5,               # 每个 anchor 上的采样点数 S
+#   num_learnable_pts=0,        # 角点之外的可学习局部点数 K
+#   max_distance=10.0,          # self-attn 中 kNN 的最大距离阈值（米）
+#   scale_range=[0.01,3.2],     # 解码后 scale 的合法范围
+#   unit_xyz=[4.0,4.0,2.0],     # 解码 ∆means 的尺度单位
+#   dropout=0.1,
+# )
+# 其内部子模块的关键配置:
+# - GaussianAggregator(img_feature_dim, lidar_feature_dim, output_dim, pc_range, num_learnable_pts)
+# - TPVFeatureFlattener()
+# - SparseGaussianSelfAttention(embed_dims, num_heads, k_neighbors, dropout, max_distance)
+# - GaussianTPVCrossAttention(embed_dims, num_heads, num_levels=3, num_points, dropout,
+#                             batch_first=True, use_offset=True, fuse='concat'或'sum', per_level_gating=True)
+# - GaussianDecoder(embed_dims, pc_range, scale_range, unit_xyz)
+
+# 3) 模块输入 / 输出 与形状
+# ----------------------------------------------------------
+# 3.1 TPVFeatureFlattener
+# 输入:
+#   tpv_xy: [B, C_tpv, H_xy, W_xy]
+#   tpv_xz: [B, C_tpv, H_xz, W_xz]
+#   tpv_yz: [B, C_tpv, H_yz, W_yz]
+# 输出:
+#   value: [B, sum(H_l*W_l), C_tpv]
+#   spatial_shapes: [3, 2] = [[H_xy,W_xy],[H_xz,W_xz],[H_yz,W_yz]] (long)
+#   level_start_index: [3] (long)
+
+# 3.2 GaussianAggregator
+# 输入（两种模式，当前在 Refiner 中使用分离输入模式）:
+#   img_gaussians / lidar_gaussians: {
+#       'mu': [N_img/N_lidar, 3], 'scale': [N,3], 'rotation': [N,4], 'features': [N, feature_dim]
+#   }
+#   tpv_spatial_shapes(可选): [3,2]，提供则参考点归一化到 [0,1]
+# 输出(merged):
+#   'mu': [N, 3], 'scale': [N,3], 'rotation': [N,4], 'features': [N, embed_dims]
+#   'ref_xy': [N, 5+K, 2], 'ref_xz': [N, 5+K, 2], 'ref_yz': [N, 5+K, 2]
+#   'corners_3d': [N, 5+K, 3]
+
+# 3.3 SparseGaussianSelfAttention
+# 输入:
+#   features: [N, embed_dims]
+#   means:    [N, 3]
+# 输出:
+#   updated_features: [N, embed_dims]
+# 说明:
+#   - 内部构建 kNN 图（FAISS / fallback），按距离阈值过滤；
+#   - Q/K/V 用 reshape + contiguous，attn logits 按 scale→mask→softmax 顺序；
+#   - 使用稳定的负常数屏蔽无效邻居；残差 + LayerNorm。
+
+# 3.4 GaussianTPVCrossAttention（每层独立，锚点感知）
+# 输入:
+#   query:  [B, N, embed_dims]
+#   value:  [B, sum(H_l*W_l), embed_dims]
+#   reference_points_list: 长度 L=3 的列表，各为 [B, N, A_l, 2]（归一化到 [0,1]）
+#   spatial_shapes:     [3, 2]
+#   level_start_index:  [3]
+# 输出:
+#   cross_features: [B, N, embed_dims]
+# 说明:
+#   - 每个 level 生成独立的 attn logits 与 offsets（形状显式包含 anchor 维 A_l）；
+#   - 偏移按 (W_l,H_l) 归一化；越界位置使用 NEG_INF 屏蔽后再 softmax；
+#   - 仅在该层的 (A_l * S) 上 softmax；
+#   - 采样使用向量化 F.grid_sample；
+#   - 三层输出通过 concat+线性或带门控的 sum 融合，残差 + LayerNorm。
+
+# 3.5 GaussianDecoder
+# 输入:
+#   updated_features: [N, embed_dims]
+#   original_gaussian: Dict（包含 'mu','scale','rotation','features'）
+# 输出:
+#   返回原字典（原地更新）:
+#     'mu': [N,3]（加上 sigmoid 映射后的 ∆means）
+#     'scale': [N,3]（加上 tanh 限幅的 ∆scales 并 clamp 到合法范围）
+#     'rotation': [N,4]（与归一化的增量四元数相乘并再归一化）
+#     'features': [N, embed_dims]（设为 updated_features）
+
+# 版本/兼容性备注
+# ----------------------------------------------------------
+# - 采用 .reshape() + .contiguous() 以避免非连续内存风险；
+# - fp16/bf16 下使用 -1e4，fp32 使用 -1e9 作为 NEG_INF；
+# - Refiner 当前断言 B==1；需要多 batch 时请在上游处理；
+# - TPV 形状在测试中使用: xy=[B,128,704,256], xz=[B,128,256,32], yz=[B,128,704,32]。
