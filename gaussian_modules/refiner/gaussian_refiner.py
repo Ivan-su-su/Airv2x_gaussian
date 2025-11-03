@@ -135,7 +135,8 @@ class GaussianTPVRefiner(nn.Module):
         self,
         img_gaussians: Dict[str, torch.Tensor],
         lidar_gaussians: Dict[str, torch.Tensor],
-        tpv_features: Dict[str, torch.Tensor]
+        tpv_features: Dict[str, torch.Tensor],
+        merged_gaussians: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         前向传播
@@ -176,11 +177,17 @@ class GaussianTPVRefiner(nn.Module):
         )  # tpv_value: [B, sum(H_l*W_l), tpv_feature_dim], spatial_shapes: [3, 2]
         
         # 2. 聚合 img 和 lidar 高斯点，并归一化参考点
-        merged_gaussians = self.gaussian_aggregator(
-            img_gaussians=img_gaussians,
-            lidar_gaussians=lidar_gaussians,
-            tpv_spatial_shapes=spatial_shapes  # 传入spatial_shapes进行归一化
-        )  # Dict: 'mu', 'scale', 'rotation', 'features', 'ref_xy', 'ref_xz', 'ref_yz' (已归一化)
+        if merged_gaussians is None:
+            merged_gaussians = self.gaussian_aggregator(
+                    img_gaussians=img_gaussians,
+                    lidar_gaussians=lidar_gaussians,
+                    tpv_spatial_shapes=spatial_shapes  # 传入spatial_shapes进行归一化
+                )  # Dict: 'mu', 'scale', 'rotation', 'features', 'ref_xy', 'ref_xz', 'ref_yz' (已归一化)
+        else:
+            merged_gaussians = self.gaussian_aggregator(
+                merged_gaussians=merged_gaussians,
+                tpv_spatial_shapes=spatial_shapes  # 传入spatial_shapes进行归一化
+            )  # Dict: 'mu', 'scale', 'rotation', 'features', 'ref_xy', 'ref_xz', 'ref_yz' (已归一化)
         
         # TPV特征投影到embed_dims维度
         tpv_value = self.tpv_proj(tpv_value)  # [B, sum(H_l*W_l), embed_dims]

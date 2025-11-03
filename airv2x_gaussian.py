@@ -1,9 +1,7 @@
 from opencood.models.mambafusion_modules.detector3d_template import Detector3DTemplate
-from opencood.models.mambafusion_modules import backbones_image, view_transforms, mm_backbone
-from opencood.models.mambafusion_modules.backbones_image import img_neck
-from opencood.models.mambafusion_modules.backbones_2d import fuser
-from opencood.models.mambafusion_modules.spconv_utils import find_all_spconv_keys
-from opencood.models.mambafusion_modules.vmamba import build_vssm_model
+from gaussian_modules import backbone_2d
+from gaussian_modules import backbone_3d
+form gaussian_modules import refiner
 import torch.profiler
 import torch.nn.functional as F
 from easydict import EasyDict
@@ -104,7 +102,7 @@ class Airv2xGaussian(Detector3DTemplate):
         
         print("=" * 80)
     
-    def build_backbone(self, model_info_dict):
+    def build_backbone2d(self, model_info_dict):
         """构建共享 Backbone 特征提取模块"""
         if self.model_cfg.get('BACKBONE', None) is None:
             return None, model_info_dict
@@ -115,7 +113,7 @@ class Airv2xGaussian(Detector3DTemplate):
         
         return backbone_module, model_info_dict
     
-    def build_lss(self, model_info_dict):
+    def build_backbone3d(self, model_info_dict):
         """构建LSS深度估计模块"""
         if self.model_cfg.get('LSS', None) is None:
             return None, model_info_dict
@@ -126,7 +124,7 @@ class Airv2xGaussian(Detector3DTemplate):
         
         return lss_module, model_info_dict
     
-    def build_gaussian_init(self, model_info_dict):
+    def build_refiner(self, model_info_dict):
         """构建图像端高斯初始化模块"""
         if self.model_cfg.get('GAUSSIAN_INIT', None) is None:
             return None, model_info_dict
@@ -136,17 +134,6 @@ class Airv2xGaussian(Detector3DTemplate):
         model_info_dict['module_list'].append(gaussian_init_module)
         
         return gaussian_init_module, model_info_dict
-    
-    def build_confidence_map(self, model_info_dict):
-        """构建Confidence Map预测模块"""
-        if self.model_cfg.get('CONFIDENCE_MAP', None) is None:
-            return None, model_info_dict
-        
-        # TODO: 实现confidence_map模块初始化
-        confidence_map_module = None  # 暂时为空
-        model_info_dict['module_list'].append(confidence_map_module)
-        
-        return confidence_map_module, model_info_dict
     
     def build_construct_TPV(self, model_info_dict):
         """构建TPV三平面表征构建模块"""
@@ -159,38 +146,6 @@ class Airv2xGaussian(Detector3DTemplate):
         
         return construct_TPV_module, model_info_dict
     
-    def build_gaussian_update(self, model_info_dict):
-        """构建高斯-TPV交互更新模块"""
-        if self.model_cfg.get('GAUSSIAN_UPDATE', None) is None:
-            return None, model_info_dict
-        
-        # TODO: 实现gaussian_update模块初始化
-        gaussian_update_module = None  # 暂时为空
-        model_info_dict['module_list'].append(gaussian_update_module)
-        
-        return gaussian_update_module, model_info_dict
-    
-    def build_map_to_TPV(self, model_info_dict):
-        """构建多Agent融合机制模块"""
-        if self.model_cfg.get('MAP_TO_TPV', None) is None:
-            return None, model_info_dict
-        
-        # TODO: 实现map_to_TPV模块初始化
-        map_to_TPV_module = None  # 暂时为空
-        model_info_dict['module_list'].append(map_to_TPV_module)
-        
-        return map_to_TPV_module, model_info_dict
-    
-    def build_gaussian_final(self, model_info_dict):
-        """构建高斯→BEV可微投影模块"""
-        if self.model_cfg.get('GAUSSIAN_FINAL', None) is None:
-            return None, model_info_dict
-        
-        # TODO: 实现gaussian_final模块初始化
-        gaussian_final_module = None  # 暂时为空
-        model_info_dict['module_list'].append(gaussian_final_module)
-        
-        return gaussian_final_module, model_info_dict
     
     def _load_state_dict(self, model_state_disk, *, strict=True):
         """加载模型状态字典"""
@@ -251,10 +206,13 @@ class Airv2xGaussian(Detector3DTemplate):
         # 按照模块拓扑结构执行前向传播
         for cur_module, model_name in zip(self.module_list, self.module_topology):
             if cur_module is not None:
-                if model_name in ['backbone', 'lss', 'gaussian_init', 'confidence_map']:
-                    # 这些模块需要agent参数，但只处理有效的agent
+                if model_name == 'backbone3d':
                     for agent in available_agents:
                         batch_dict = cur_module(batch_dict, agent)
+                elif model_name == 'refiner':
+                    for agent in available_agents:
+                        batch_dict['agent']['gaussians'] = cur_module(batch_dict['agent']['iamge_gaussians'], batch_dict['agent']['lidar_gaussians'], batch_dict['tpv_features'])
+                        batch_dict['agent']['gaussians'] = cur_module(batch_dict['agent']['gaussians'], batch_dict['tpv_features'])
                 elif model_name in ['construct_TPV', 'gaussian_update', 'map_to_TPV']:
                     # 这些模块处理多agent融合
                     batch_dict = cur_module(batch_dict, available_agents)
@@ -274,13 +232,6 @@ class Airv2xGaussian(Detector3DTemplate):
             obj = self.obj_head(spatial_features)  # [B, A, H, W] = [B, 2, 180, 180]
             
             print(f"[Airv2xGaussian] 输出尺寸: psm={psm.shape}, rm={rm.shape}, obj={obj.shape}")
-            
-        else:
-            # 如果没有特征，创建空的特征
-            default_H, default_W = 100, 352
-            psm = torch.zeros(1, 14, default_H, default_W, device=next(self.parameters()).device)  # 2*7=14
-            rm = torch.zeros(1, 14, default_H, default_W, device=next(self.parameters()).device)   # 2*7=14
-            obj = torch.zeros(1, 2, default_H, default_W, device=next(self.parameters()).device)   # 2
         
         # 创建AirV2X兼容的输出格式
         output_dict = {
