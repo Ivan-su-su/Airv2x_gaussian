@@ -76,7 +76,7 @@ class GaussianImageBackbone(nn.Module):
 
     def forward(self, batch_dict):
         """
-        完整的前向传播流程 - 双分辨率架构
+        完整的前向传播流程 - 统一 64×176 低分辨率架构
         Args:
             batch_dict: 包含多Agent图像数据的字典
         Returns:
@@ -89,34 +89,23 @@ class GaussianImageBackbone(nn.Module):
                 
                 # 1. 图像特征提取（低分辨率，节省显存）
                 image_features = self.image_backbone(agent_data)  # [B, N, C, 64, 176]
+                B, N = image_features.shape[:2]
                 
-                # 2. 获取原始高分辨率图像用于检测
+                # 2. 使用检测头基于 backbone 特征生成低分辨率置信度图
+                det_out = self.detection_head(image_features)  # 使用 backbone 特征
+                conf_map = det_out['value_scores']  # [B, N, 1, 64, 176] soft mask
+                
+                # 3. 获取相机参数
                 cam_inputs = agent_data['batch_merged_cam_inputs']
-                imgs = cam_inputs['imgs']  # [B, N, C, 256, 704]
-                B, N, C, H, W = imgs.shape
-                
-                # 3. 使用轻量级检测头直接从原始图像生成中等分辨率置信度图
-                mid_res_conf = self.detection_head.forward_from_raw(imgs)  # [B, N, 1, 128, 352]
-                
-                # 4. 将中等分辨率置信度图下采样到低分辨率（与depth匹配）
-                conf_map_lowres = F.interpolate(
-                    mid_res_conf.view(B * N, 1, 128, 352), 
-                    size=(32, 88), 
-                    mode='bilinear', 
-                    align_corners=False
-                ).view(B, N, 1, 32, 88)  # [B, N, 1, 32, 88]
-                
-                # 5. 获取相机参数
                 intrinsics = cam_inputs['intrinsics']  # [B, N, 3, 3]
                 extrinsics = cam_inputs['extrinsics']  # [B, N, 4, 4]
                 
-                # 6. TPV投影和高斯生成（传入低分辨率conf_map和中等分辨率conf_map）
+                # 4. TPV投影和高斯生成（全部使用低分辨率 64×176）
                 tpv_results = self.tpv_projector(
-                    image_features, 
-                    conf_map_lowres, 
-                    intrinsics, 
-                    extrinsics,
-                    mid_res_conf=mid_res_conf  # 额外传入中等分辨率置信图
+                    image_features,
+                    conf_map,
+                    intrinsics,
+                    extrinsics
                 )
                 
                 # 7. 将结果存储到对应agent的batch_dict中
@@ -187,7 +176,7 @@ class GaussianImageFeatureExtractor(nn.Module):
                 nn.Conv2d(256, self.out_channels, kernel_size=1),
             )
         elif self.backbone_type == 'SimpleCNN':
-            # 简单的CNN backbone - 压缩到32x88分辨率
+            # 简单的CNN backbone - 压缩到64x176分辨率
             self.conv_layers = nn.Sequential(
                 # 第一层：输入3通道 -> 64通道，保持尺寸
                 nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
@@ -215,8 +204,7 @@ class GaussianImageFeatureExtractor(nn.Module):
                 # 第二次pooling：128x352 -> 64x176
                 nn.MaxPool2d(kernel_size=2, stride=2),
                 
-                # 第三次pooling：64x176 -> 32x88
-                nn.MaxPool2d(kernel_size=2, stride=2),
+                # 保持在 64x176，不进行第三次下采样
             )
             
             self.feature_fusion = nn.Sequential(
@@ -258,6 +246,15 @@ class GaussianImageFeatureExtractor(nn.Module):
         # 重塑为 [B, N, C, H', W']
         _, C_out, H_out, W_out = features.shape
         features = features.view(B, N, C_out, H_out, W_out)
+        
+        # 如果输出尺寸不是 64x176，自动插值到目标尺寸（兼容 EfficientNet/ResNet）
+        if H_out != 64 or W_out != 176:
+            features = F.interpolate(
+                features.view(B * N, C_out, H_out, W_out),
+                size=(64, 176),
+                mode='bilinear',
+                align_corners=False
+            ).view(B, N, C_out, 64, 176)
         
         return features
 
@@ -409,6 +406,7 @@ class GaussianDetectionHead(nn.Module):
     def forward_from_raw(self, raw_imgs):
         """
         从原始图像生成中等分辨率置信图（轻量版）
+        注意：此方法已废弃，当前架构使用 forward(image_features) 基于 backbone 特征
         Args:
             raw_imgs: [B, N, 3, H, W] 原始图像 (256x704)
         Returns:
@@ -513,14 +511,13 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
     # ====================================================
     # 主前向：LSS → TPV → Gaussian
     # ====================================================
-    def forward(self, image_feat, conf_map, intrinsics, extrinsics, mid_res_conf=None):
+    def forward(self, image_feat, conf_map, intrinsics, extrinsics):
         """
         Args:
-            image_feat: [B, N, C, H, W] 低分辨率特征 (64x176)
-            conf_map:   [B, N, 1, H, W] 低分辨率置信图（用于TPV生成）(64x176)
+            image_feat: [B, N, C, 64, 176]  backbone + depthnet 输出特征
+            conf_map:   [B, N, 1, 64, 176]  detection head 输出的软置信度
             intrinsics: [B, N, 3, 3]
             extrinsics: [B, N, 4, 4]
-            mid_res_conf: [B, N, 1, 128, 352] 中等分辨率置信图（用于高斯生成）
         """
         B, N, C, H, W = image_feat.shape
         device = image_feat.device
@@ -532,14 +529,11 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
         _, _, _, H, W = image_features.shape
         geom_coords = self._compute_world_coords(intrinsics, extrinsics, H, W)  # 不会展开 D×H×W
 
-        # Step 3: scatter_add → TPV（使用低分辨率conf_map）
+        # Step 3: scatter_add → TPV（使用低分辨率特征）
         tpv = self._build_tpv_from_lss(image_features, depth_prob, geom_coords)
 
-        # Step 4: 高斯生成（使用中等分辨率conf_map）
-        if mid_res_conf is not None:
-            gaussians = self._generate_gaussians(mid_res_conf, image_features, depth_prob, geom_coords)
-        else:
-            gaussians = self._generate_gaussians(conf_map, image_features, depth_prob, geom_coords)
+        # Step 4: 高斯生成（全部使用低分辨率 64×176）
+        gaussians = self._generate_gaussians(conf_map, image_features, depth_prob, geom_coords)
 
         return {"tpv_features": tpv, "gaussians": gaussians}
 
@@ -650,38 +644,18 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
     # ====================================================
     def _generate_gaussians(self, conf_map, image_feat, depth_prob, world_coords):
         """
-        生成高斯点 - 支持三分辨率
+        生成高斯点 - 全部使用低分辨率 64×176 特征
         Args:
-            conf_map: [B, N, 1, H_conf, W_conf] 置信图（可能是中等分辨率128x352或低分辨率64x176）
-            image_feat: [B, N, C, H_feat, W_feat] 低分辨率特征 64x176
-            depth_prob: [B, N, D, H_feat, W_feat] 低分辨率深度概率 64x176
-            world_coords: [B, N, D, H_feat, W_feat, 3] 低分辨率世界坐标 64x176
+            conf_map:   [B, N, 1, H, W]   与 image_feat 同分辨率 (64x176)
+            image_feat: [B, N, C, H, W]   低分辨率特征 (64x176)
+            depth_prob: [B, N, D, H, W]    低分辨率深度概率 (64x176)
+            world_coords: [B, N, D, H, W, 3] 低分辨率世界坐标 (64x176)
         """
-        B, N, C, H_feat, W_feat = image_feat.shape
-        H_conf, W_conf = conf_map.shape[-2:]
-        device = image_feat.device
+        B, N, C, H, W = image_feat.shape
         D = self.depth_bins
+        device = image_feat.device
 
-        # 如果置信图是中等分辨率，需要上采样深度和特征（避免world_coords上采样）
-        if H_conf != H_feat or W_conf != W_feat:
-            # 上采样深度概率到中等分辨率
-            depth_prob = F.interpolate(
-                depth_prob.view(B * N, D, H_feat, W_feat), 
-                size=(H_conf, W_conf), 
-                mode='nearest'
-            ).view(B, N, D, H_conf, W_conf)
-            
-            # 上采样图像特征到中等分辨率
-            image_feat = F.interpolate(
-                image_feat.view(B * N, C, H_feat, W_feat), 
-                size=(H_conf, W_conf), 
-                mode='bilinear', 
-                align_corners=False
-            ).view(B, N, C, H_conf, W_conf)
-            
-            # 注意：不进行world_coords上采样，使用索引映射方式
-
-        # 直接收集所有高斯点
+        # 直接收集所有高斯点（全部基于 64×176 网格）
         all_mu = []
         all_scale = []
         all_rotation = []
@@ -689,51 +663,44 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
         
         for b in range(B):
             for n in range(N):
-                conf = conf_map[b,n,0]
-                # 使用soft mask：阈值降到0.1以包含更多候选
-                mask = conf > 0.1
-                coords_2d = torch.nonzero(mask, as_tuple=False)  # [num_pixels,2]
+                conf = conf_map[b, n, 0]  # [H, W]
+                # 使用 soft mask：阈值过滤
+                mask = conf > self.gaussian_threshold
+                coords_2d = mask.nonzero(as_tuple=False)  # [num_pixels, 2]
                 if coords_2d.shape[0] == 0:
                     continue
 
-                num_pixels = coords_2d.shape[0]
-                dprob = depth_prob[b,n,:,coords_2d[:,0],coords_2d[:,1]].T  # [num_pixels,D]
+                # 深度概率 [num_pixels, D]
+                dprob = depth_prob[b, n, :, coords_2d[:, 0], coords_2d[:, 1]].T
                 
-                # 动态 TopK: 根据置信度自适应调整
-                adaptive_k = max(5, int(self.top_k_depths * conf.mean().item() * 2))
-                adaptive_k = min(adaptive_k, D)  # 不超过总深度bin数
-                topk_prob, topk_idx = torch.topk(dprob, adaptive_k, dim=1)
+                # 固定或自适应 top-k 深度
+                k = min(self.top_k_depths, D)
+                topk_prob, topk_idx = torch.topk(dprob, k, dim=1)
                 
                 valid_mask = topk_prob > self.gaussian_threshold
-                sel_idx = torch.nonzero(valid_mask, as_tuple=False)
+                sel_idx = valid_mask.nonzero(as_tuple=False)
                 if sel_idx.shape[0] == 0:
                     continue
                             
                 # 获取所有有效像素与深度索引
-                px = coords_2d[sel_idx[:,0]]
-                dz = topk_idx[sel_idx[:,0], sel_idx[:,1]]
-                pprob = topk_prob[sel_idx[:,0], sel_idx[:,1]]
+                px = coords_2d[sel_idx[:, 0]]  # [K', 2]
+                dz = topk_idx[sel_idx[:, 0], sel_idx[:, 1]]  # [K']
+                pprob = topk_prob[sel_idx[:, 0], sel_idx[:, 1]]  # [K']
                 
-                # 使用soft mask：将像素置信度纳入概率计算
-                px_conf = conf[px[:,0], px[:,1]]  # [M]
+                # 使用 soft mask：将像素置信度纳入概率计算
+                px_conf = conf[px[:, 0], px[:, 1]]  # [K']
                 pprob = pprob * px_conf  # 加权深度概率
 
-                # 对应的世界坐标（使用索引映射避免上采样）
-                if H_conf != H_feat or W_conf != W_feat:
-                    # 将中等分辨率像素坐标映射到低分辨率
-                    px_lowres = torch.stack([
-                        px[:,0] * H_feat // H_conf,
-                        px[:,1] * W_feat // W_conf
-                    ], dim=1)
-                    wcoord = world_coords[b,n,dz,px_lowres[:,0],px_lowres[:,1]]  # [M,3]
-                else:
-                    wcoord = world_coords[b,n,dz,px[:,0],px[:,1]]  # [M,3]
-                feat = image_feat[b,n,:,px[:,0],px[:,1]].T * pprob.unsqueeze(1)
+                # 世界坐标、特征都直接用 64×176 索引
+                wcoord = world_coords[b, n, dz, px[:, 0], px[:, 1]]  # [K', 3]
+                feat = image_feat[b, n, :, px[:, 0], px[:, 1]].T * pprob.unsqueeze(1)  # [K', C]
 
                 # 高斯参数计算 (使用指数插值优化scale)
                 s_min, s_max = self.gaussian_scale_range
-                scale = (s_min * (s_max / s_min) ** pprob.unsqueeze(1)).repeat(1, 3)
-                rotation = torch.tensor([1,0,0,0], device=device).repeat(wcoord.size(0),1)
+                scale = (s_min * (s_max / s_min) ** pprob.unsqueeze(1)).repeat(1, 3)  # [K', 3]
+                # 构造旋转四元数 [w, x, y, z] = [1, 0, 0, 0]（单位四元数，无旋转）
+                rotation = torch.ones((wcoord.size(0), 4), device=device)
+                rotation[:, 1:] = 0.0  # [K', 4]
 
                 # 直接保存高斯点参数
                 all_mu.append(wcoord)
@@ -747,7 +714,7 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
                 'mu': torch.empty(0, 3, device=device),
                 'scale': torch.empty(0, 3, device=device),
                 'rotation': torch.empty(0, 4, device=device),
-                'features': torch.empty(0, 128, device=device)
+                'features': torch.empty(0, C, device=device)
             }
         else:
             gaussians_compressed = {
@@ -759,7 +726,7 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
 
         # 添加高斯点数量日志
         num_gaussians = gaussians_compressed['mu'].shape[0]
-        print(f"[GaussianTPV] Generated {num_gaussians} Gaussians at {H_conf}×{W_conf}")
+        print(f"[GaussianTPV] Generated {num_gaussians} Gaussians at {H}×{W} (64x176 grid)")
 
         return gaussians_compressed
 
