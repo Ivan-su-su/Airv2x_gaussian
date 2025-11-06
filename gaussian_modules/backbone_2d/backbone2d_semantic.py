@@ -78,7 +78,7 @@ class GaussianImageBackbone(nn.Module):
         # 支持的Agent类型
         self.agent_types = model_cfg.get('AGENT_TYPES', ['vehicle', 'rsu', 'drone'])
 
-    def forward(self, batch_dict):
+    def forward(self, batch_dict, semantic_head = None):
         """
         完整的前向传播流程 - 双分辨率架构
         Args:
@@ -105,13 +105,14 @@ class GaussianImageBackbone(nn.Module):
                 intrinsics = cam_inputs['intrinsics']  # [B, N, 3, 3]
                 extrinsics = cam_inputs['extrinsics']  # [B, N, 4, 4]
                 
-                # 6. TPV投影和高斯生成（仅使用低分辨率 conf_map）
+                # 6. TPV投影和高斯生成（仅使用低分辨率 conf_map
                 tpv_results = self.tpv_projector(
                     image_features,
                     conf_map=class_probs,
                     intrinsics=intrinsics,
                     extrinsics=extrinsics,
                     topk_mask=topk_mask,
+                    semantic_head=semantic_head
                 )
                 
                 # 7. 将结果存储到对应agent的batch_dict中
@@ -518,10 +519,8 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
         # Step 2: LSS 投影 (几何变换) - 按需生成正确的frustum尺寸
         _, _, _, H, W = image_features.shape
         geom_coords = self._compute_world_coords(intrinsics, extrinsics, H, W)  # 不会展开 D×H×W
-
         # Step 3: scatter_add → TPV（使用低分辨率特征）
-        tpv = self._build_tpv_from_lss(image_features, depth_prob, geom_coords)
-
+        tpv = self._build_tpv_from_lss_v2(image_features, depth_prob, geom_coords) #实测优化版 快0.5s
         # Step 4: 高斯生成（全部使用低分辨率，避免上采样）
         gaussians = self._generate_gaussians(conf_map, topk_mask, image_features, depth_prob, geom_coords)
 
@@ -626,6 +625,74 @@ class OptimizedLSSBasedTPVGeneratorV2(nn.Module):
             tpv_yz[b].view(C, -1).index_add_(1, flat_yz, weighted_feats.T)
 
         return {"xy": tpv_xy, "xz": tpv_xz, "yz": tpv_yz}
+    def _build_tpv_from_lss_v2(self, image_feat, depth_prob, world_coords):
+        """
+        优化版 TPV 投影 (PyTorch ≥2.0, 使用 scatter_reduce 实现 GPU 全并行)
+        - 保留 xy/xz/yz 三平面逻辑
+        - 与 BEVPoolv2 等价的 rank 聚合逻辑
+        - 无 Python 循环，无排序
+        """
+        B, N, C, H, W = image_feat.shape
+        D = self.depth_bins
+        device = image_feat.device
+
+        # Step 1: flatten 所有输入
+        coords = world_coords.reshape(B, N, D * H * W, 3)
+        probs = depth_prob.reshape(B, N, D * H * W)
+        feats = image_feat.permute(0, 1, 3, 4, 2).reshape(B, N, 1, H * W, C)
+        feats = feats.repeat(1, 1, D, 1, 1).reshape(B, N, D * H * W, C)
+
+        # 世界坐标 -> 体素索引
+        pc_range_tensor = torch.tensor(self.pc_range[:3], device=device)
+        voxel_size_tensor = torch.tensor(self.voxel_size, device=device)
+        voxel_indices = ((coords - pc_range_tensor) / voxel_size_tensor).long()
+
+        # Clamp 保证合法索引
+        voxel_indices[..., 0] = torch.clamp(voxel_indices[..., 0], 0, self.tpv_size[0] - 1)
+        voxel_indices[..., 1] = torch.clamp(voxel_indices[..., 1], 0, self.tpv_size[1] - 1)
+        voxel_indices[..., 2] = torch.clamp(voxel_indices[..., 2], 0, self.tpv_size[2] - 1)
+
+        # 合并 batch + camera
+        voxel_indices = voxel_indices.reshape(-1, 3)
+        feats = feats.reshape(-1, C)
+        probs = probs.reshape(-1)
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, N, D * H * W).reshape(-1)
+
+        valid = probs > 1e-4
+        voxel_indices, feats, probs, batch_idx = \
+            voxel_indices[valid], feats[valid], probs[valid], batch_idx[valid]
+
+        # Step 2: 计算各平面 rank（每个 batch 内唯一）
+        Hy, Wx, Dz = self.tpv_size
+        y, x, z = voxel_indices[:, 0], voxel_indices[:, 1], voxel_indices[:, 2]
+
+        rank_xy = batch_idx * (Hy * Wx) + (y * Wx + x)
+        rank_xz = batch_idx * (Wx * Dz) + (x * Dz + z)
+        rank_yz = batch_idx * (Hy * Dz) + (y * Dz + z)
+
+        weighted_feats = feats * probs.unsqueeze(1)
+
+        # Step 3: 定义 GPU 原语聚合函数 (无循环, 无排序)
+        def scatter_plane(rank, feats, plane_shape):
+            plane_voxels = plane_shape[0] * plane_shape[1]
+            num_total = B * plane_voxels
+            pooled = torch.zeros(num_total, C, device=device)
+            pooled.scatter_reduce_(
+                dim=0,
+                index=rank.unsqueeze(1).expand(-1, C),
+                src=feats,
+                reduce="sum",
+                include_self=False
+            )
+            return pooled.view(B, plane_voxels, C).permute(0, 2, 1).reshape(B, C, *plane_shape)
+
+        # Step 4: 三平面聚合
+        tpv_xy = scatter_plane(rank_xy, weighted_feats, (Hy, Wx))
+        tpv_xz = scatter_plane(rank_xz, weighted_feats, (Wx, Dz))
+        tpv_yz = scatter_plane(rank_yz, weighted_feats, (Hy, Dz))
+
+        return {"xy": tpv_xy, "xz": tpv_xz, "yz": tpv_yz}
+
 
     # ====================================================
     # Step 4: conf_map 控制高斯生成

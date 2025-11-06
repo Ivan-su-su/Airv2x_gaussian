@@ -32,12 +32,12 @@ class DynamicVoxelVFE(VFETemplate):
         if self.with_distance:
             num_point_features += 1
 
-        self.num_filters = self.model_cfg.NUM_FILTERS
+        self.num_filters = self.model_cfg.NUM_FILTERS   #[128, 128]
         assert len(self.num_filters) > 0
-        num_filters = [num_point_features] + list(self.num_filters)
+        num_filters = [num_point_features] + list(self.num_filters)   #[4+6, 128, 128]
 
         pfn_layers = []
-        for i in range(len(num_filters) - 1):
+        for i in range(len(num_filters) - 1):   #2
             in_filters = num_filters[i]
             out_filters = num_filters[i + 1]
             pfn_layers.append(
@@ -59,16 +59,22 @@ class DynamicVoxelVFE(VFETemplate):
         return self.num_filters[-1]
 
     def forward(self, batch_dict, agent=None, **kwargs):
+        # 最开始batch_dict的结构是：
+            # {
+            #     'vehicle': {
+            #         'origin_lidar': tensor,
+            #     },
+            #     'rsu': {
+            #         'origin_lidar': tensor,
+            #     },
+            #     'drone': {
+            #         'origin_lidar': tensor,
+            #     },
+            # }
         # 处理agent参数
-        if agent is None or agent == 'vehicle':
-            points = batch_dict.get('origin_lidar', None)
-        else:
-            points = batch_dict.get(f'origin_lidar_{agent}', None)
-        
-        if points is None:
-            raise KeyError(f"Could not find 'origin_lidar' or 'origin_lidar_{agent}' in batch_dict")
-        
-       # 检查点云是否为空
+        points = batch_dict[agent]['origin_lidar']
+
+        # 检查点云是否为空
         if len(points.shape) == 3 and points.shape[0] == 1:
             # 去掉batch维度：[1, N, 4] -> [N, 4]
             points = points.squeeze(0)
@@ -161,7 +167,7 @@ class DynamicVoxelVFE(VFETemplate):
                                     (unq_coords % scale_yz) // scale_z,
                                     unq_coords % scale_z), dim=1)
         # 将之前的合并索引解码回三元组索引并重排为[z, y, x]的格式，(num_voxel,3)
-        voxel_coords = voxel_coords[:, [2, 1, 0]]
+        voxel_coords = voxel_coords[:, [3, 2, 1]]
         # 增加一个batch_idx维度，因为SparseConvTensor需要batch_idx维度 (num_voxel,4)
         # TODO
         voxel_coords = torch.cat([torch.zeros(voxel_coords.shape[0], 1, device=voxel_coords.device).int(), voxel_coords], dim=1)
@@ -173,7 +179,7 @@ class DynamicVoxelVFE(VFETemplate):
 
 
 
-class GaussianBackbone3D(nn.Module):
+class Gaussian3D(nn.Module):
     """
     Optimized Learnable Gaussian Backbone 3D
     --------------------------------------------------------
@@ -212,6 +218,7 @@ class GaussianBackbone3D(nn.Module):
         # 稀疏卷积编码器 - 使用 SparseBatchNorm
         self.encoder = spconv.SparseSequential(
             spconv.SubMConv3d(self.num_features, self.hidden_dim, 3, padding=1, bias=False),
+            # 输入输出的尺寸相同，不下采样
             spconv.SparseBatchNorm(self.hidden_dim),
             nn.ReLU(True),
             spconv.SubMConv3d(self.hidden_dim, self.hidden_dim, 3, padding=1, bias=False),
@@ -222,10 +229,8 @@ class GaussianBackbone3D(nn.Module):
         # Mask Head
         self.mask_head = spconv.SubMConv3d(self.hidden_dim, 1, kernel_size=1)
 
-        # Param Head - 只在选中的voxel计算
-        # 输出: [scale(3) + rotation(4) + features(num_features)]
-        # 注意：不再预测 μ_offset，μ直接使用voxel的真实坐标
-        out_dim = 3 + 4 + self.num_features
+        # Param Head - 只在选中的voxel计算 生成高斯参数
+        out_dim = 3 + 3 + 4 + self.num_features
         self.param_head = spconv.SubMConv3d(self.hidden_dim, out_dim, kernel_size=1)
         
         # 可选：可学习的尺度偏置
@@ -234,7 +239,7 @@ class GaussianBackbone3D(nn.Module):
         # 参数初始化
         self._init_weights()
 
-        print(f"[Optimized GaussianBackbone3D] 初始化完成:")
+        print(f"[Optimized Gaussian3D] 初始化完成:")
         print(f"  - Grid Size: {self.grid_size}")
         print(f"  - Feature Dim: {self.num_features}")
         print(f"  - Hidden Dim: {self.hidden_dim}")
@@ -254,15 +259,11 @@ class GaussianBackbone3D(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, batch_dict, agent=None, **kwargs):
-        if agent is not None:
-            voxel_features = batch_dict[agent]['voxel_features']
-            voxel_coords = batch_dict[agent]['voxel_coords']
-        else:
-            voxel_features = batch_dict['voxel_features']
-            voxel_coords = batch_dict['voxel_coords']
-
+        voxel_features = batch_dict[agent]['voxel_features']
+        voxel_coords = batch_dict[agent]['voxel_coords']
+        
         device = voxel_features.device
-        batch_size = voxel_coords[:, 0].max().int().item() + 1
+        batch_size = voxel_coords[:, 0].max().int().item() + 1   #1
         spatial_shape = (self.grid_size[2], self.grid_size[1], self.grid_size[0])
 
         # step 1: SparseConv 编码
@@ -307,7 +308,7 @@ class GaussianBackbone3D(nn.Module):
         sel_coords = encoded.indices[sel_idx]  # [K, 4]
         sel_features = encoded.features[sel_idx]  # [K, hidden_dim]
         
-        # 创建稀疏tensor只为选中的voxel（直接使用sel，不要unsqueeze）
+        # 创建稀疏tensor只为选中的voxel（直接使用sel，不要unsqueeze） 生成高斯参数
         coords_sparse = sel_coords  # [K, 4]
         features_sparse = sel_features  # [K, hidden_dim]
         sp_input = spconv.SparseConvTensor(features_sparse, coords_sparse, spatial_shape, batch_size)
@@ -319,13 +320,13 @@ class GaussianBackbone3D(nn.Module):
             params = torch.where(torch.isnan(params), torch.zeros_like(params), params)
 
         # 解析参数并约束范围
-        # params: [K, 3+4+num_features] = [scale(3) + rotation(4) + features]
-        s_param = torch.clamp(F.softplus(params[:, :3] + self.scale_bias), min=0.05, max=1.5)
-        r_param = F.normalize(params[:, 3:7] + 1e-6)
-        Q_param = params[:, 7:]
+        μ_offset = params[:, :3]
+        s_param = torch.clamp(F.softplus(params[:, 3:6] + self.scale_bias), min=0.05, max=1.5)
+        r_param = F.normalize(params[:, 6:10] + 1e-6)
+        Q_param = params[:, 10:]
 
         # 计算 μ 世界坐标
-        μ_world = self._coords_to_world_no_offset(sel_coords)
+        μ_world = self._coords_to_world(sel_coords, μ_offset)
 
         # step 5: 组织输出
         gaussians = {
@@ -358,7 +359,7 @@ class GaussianBackbone3D(nn.Module):
         if self.training and torch.cuda.is_available():
             mem_mb = torch.cuda.memory_reserved() / (1024 ** 2)
             if mem_mb > 1000:  # 超过1GB时打印
-                print(f"[GPU Memory] {mem_mb:.1f} MB reserved after GaussianBackbone3D forward")
+                print(f"[GPU Memory] {mem_mb:.1f} MB reserved after Gaussian3D forward")
 
         return batch_dict
 
@@ -367,27 +368,13 @@ class GaussianBackbone3D(nn.Module):
         将 (batch, z, y, x) voxel 索引 + 偏移 转换为真实世界坐标
         固定 TPV 顺序：world_x ↔ W维度, world_y ↔ H维度, world_z ↔ Z维度
         """
+        device = μ_offset.device
         # voxel_coords: [N, 4] = [batch, z, y, x]
         # 映射：x → W维度, y → H维度, z → Z维度
         world_x = voxel_coords[:, 3].float() * self.voxel_size[0] + self.point_cloud_range[0] + μ_offset[:, 0]  # W方向
         world_y = voxel_coords[:, 2].float() * self.voxel_size[1] + self.point_cloud_range[1] + μ_offset[:, 1]  # H方向
         world_z = voxel_coords[:, 1].float() * self.voxel_size[2] + self.point_cloud_range[2] + μ_offset[:, 2]  # Z方向
         return torch.stack([world_x, world_y, world_z], dim=-1)  # [K,3]
-
-    def _coords_to_world_no_offset(self, voxel_coords):
-        """
-        将 (batch, z, y, x) voxel 索引转换为真实世界坐标（无偏移）
-        
-        Args:
-            voxel_coords: [N, 4] = [batch, z, y, x]
-        Returns:
-            μ_world: [N, 3] (x, y, z) 世界坐标
-        """
-        # 映射：x → W维度, y → H维度, z → Z维度
-        world_x = voxel_coords[:, 3].float() * self.voxel_size[0] + self.point_cloud_range[0]  # W方向
-        world_y = voxel_coords[:, 2].float() * self.voxel_size[1] + self.point_cloud_range[1]  # H方向
-        world_z = voxel_coords[:, 1].float() * self.voxel_size[2] + self.point_cloud_range[2]  # Z方向
-        return torch.stack([world_x, world_y, world_z], dim=-1)  # [N,3]
 
     def _project_to_plane_optimized(self, voxel_features, voxel_coords, plane_type, device, batch_size):
         """
@@ -458,7 +445,7 @@ class GaussianBackbone3D(nn.Module):
 class Gaussian3DBackbone(nn.Module):
     """
     Gaussian 3D Backbone - 主控制器类
-    整合 DynamicVoxelVFE 和 GaussianBackbone3D 的完整点云高斯生成流程
+    整合 DynamicVoxelVFE 和 Gaussian3D 的完整点云高斯生成流程
     """
     def __init__(self, model_cfg, grid_size=None, voxel_size=None, point_cloud_range=None, **kwargs):
         super(Gaussian3DBackbone, self).__init__()
@@ -473,20 +460,9 @@ class Gaussian3DBackbone(nn.Module):
         
         # 1. VFE配置
         vfe_cfg = model_cfg.get('VFE', {})
-        vfe_cfg.setdefault('USE_NORM', True)
-        vfe_cfg.setdefault('WITH_DISTANCE', False)
-        vfe_cfg.setdefault('USE_ABSLOTE_XYZ', True)
-        vfe_cfg.setdefault('NUM_FILTERS', [128, 128])
-        vfe_cfg.setdefault('RETURN_ABS_COORDS', False)
         
         # 2. Backbone配置
-        backbone_cfg = model_cfg.get('BACKBONE_3D', {})
-        backbone_cfg.setdefault('NUM_FEATURES', 128)
-        backbone_cfg.setdefault('HIDDEN_DIM', 128)
-        backbone_cfg.setdefault('MAX_GAUSSIAN_RATIO', 0.05)
-        backbone_cfg.setdefault('PROJECTION_METHOD', 'scatter_mean')
-        backbone_cfg.setdefault('USE_GUMBEL', False)
-        backbone_cfg.setdefault('GUMBEL_TEMPERATURE', 0.1)
+        backbone_cfg = model_cfg.get('BACKBONE', {})
         
         # VFE初始化
         num_point_features = model_cfg.get('NUM_POINT_FEATURES', 4)  # x,y,z,intensity
@@ -499,7 +475,7 @@ class Gaussian3DBackbone(nn.Module):
         )
         
         # Backbone初始化
-        self.backbone = GaussianBackbone3D(
+        self.backbone = Gaussian3D(
             model_cfg=backbone_cfg,
             grid_size=grid_size,
             voxel_size=voxel_size,
@@ -526,7 +502,17 @@ class Gaussian3DBackbone(nn.Module):
         """
         # Step 1: VFE处理 - 点云 → 体素特征
         batch_dict = self.vfe(batch_dict, agent=agent)
-        
+        # 此时batch_dict的结构是：
+            # {
+            #     'vehicle': {
+            #         'origin_lidar': tensor, [num_points, 4]
+            #         'pillar_features': tensor, [num_voxel, 128]
+            #         'voxel_features': tensor, [num_voxel, 128]
+            #         'voxel_coords': tensor, [num_voxel, 3]
+            #     },
+            #     ...,
+            # }
+
         # Step 2: Backbone处理 - 体素特征 → 高斯点
         batch_dict = self.backbone(batch_dict, agent=agent)
         
@@ -537,7 +523,7 @@ class Gaussian3DBackbone(nn.Module):
 # 高斯初始化和选择流程详解
 # ====================================================
 """
-GaussianBackbone3D 的完整工作流程：
+Gaussian3D 的完整工作流程：
 
 【流程概述】
 点云体素 → 稀疏卷积编码 → Mask预测 → Top-K选择 → 高斯参数生成 → 世界坐标转换
@@ -545,7 +531,7 @@ GaussianBackbone3D 的完整工作流程：
 【详细步骤解析】
 
 1. 输入 (batch_dict[agent])
-   - 'voxel_features': [N_voxel, 64]  - 点云体素特征
+   - 'voxel_features': [N_voxel, 64]  - 点云体素特征   dwb 这里应该是128吧？
    - 'voxel_coords': [N_voxel, 4]     - 体素坐标 [batch, z, y, x]
 
 2. 稀疏卷积编码 (Step 1)

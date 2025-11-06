@@ -24,15 +24,16 @@ class DynamicVoxelVFE(VFETemplate):
     """
     def __init__(self, model_cfg, num_point_features, voxel_size, grid_size, point_cloud_range, **kwargs):
         super().__init__(model_cfg=model_cfg)
-        self.use_norm = self.model_cfg.USE_NORM
-        self.with_distance = self.model_cfg.WITH_DISTANCE
-        self.use_absolute_xyz = self.model_cfg.USE_ABSLOTE_XYZ
+        self.model_cfg = model_cfg
+        self.use_norm = self.model_cfg.get('USE_NORM', True)
+        self.with_distance = self.model_cfg.get('WITH_DISTANCE', False)
+        self.use_absolute_xyz = self.model_cfg.get('USE_ABSLOTE_XYZ', True)
         self.return_abs_coords = self.model_cfg.get('RETURN_ABS_COORDS', False)
         num_point_features += 6 if self.use_absolute_xyz else 3
         if self.with_distance:
             num_point_features += 1
 
-        self.num_filters = self.model_cfg.NUM_FILTERS
+        self.num_filters = self.model_cfg.get('NUM_FILTERS', [128, 128])
         assert len(self.num_filters) > 0
         num_filters = [num_point_features] + list(self.num_filters)
 
@@ -61,9 +62,9 @@ class DynamicVoxelVFE(VFETemplate):
     def forward(self, batch_dict, agent=None, **kwargs):
         # 处理agent参数
         if agent is None or agent == 'vehicle':
-            points = batch_dict.get('origin_lidar', None)
+            points = batch_dict[agent].get('origin_lidar', None)
         else:
-            points = batch_dict.get(f'origin_lidar_{agent}', None)
+            points = batch_dict[agent].get(f'origin_lidar_{agent}', None)
         
         if points is None:
             raise KeyError(f"Could not find 'origin_lidar' or 'origin_lidar_{agent}' in batch_dict")
@@ -161,7 +162,7 @@ class DynamicVoxelVFE(VFETemplate):
                                     (unq_coords % scale_yz) // scale_z,
                                     unq_coords % scale_z), dim=1)
         # 将之前的合并索引解码回三元组索引并重排为[z, y, x]的格式，(num_voxel,3)
-        voxel_coords = voxel_coords[:, [2, 1, 0]]
+        voxel_coords = voxel_coords[:, [2, 1, 0]] #TODO
         # 增加一个batch_idx维度，因为SparseConvTensor需要batch_idx维度 (num_voxel,4)
         # TODO
         voxel_coords = torch.cat([torch.zeros(voxel_coords.shape[0], 1, device=voxel_coords.device).int(), voxel_coords], dim=1)
@@ -208,6 +209,10 @@ class GaussianBackbone3D(nn.Module):
         self.tpv_xy_size = [grid_size[0], grid_size[1]]
         self.tpv_xz_size = [grid_size[0], grid_size[2]]
         self.tpv_yz_size = [grid_size[1], grid_size[2]]
+        
+        # 语义分类配置
+        self.num_classes = model_cfg.get('NUM_CLASSES', 4)  # 0类为背景，1..(m-1)为前景
+        assert self.num_classes > 1, "NUM_CLASSES must be > 1 (0 for background, >=1 for foreground)."
 
         # 稀疏卷积编码器 - 使用 SparseBatchNorm
         self.encoder = spconv.SparseSequential(
@@ -219,8 +224,8 @@ class GaussianBackbone3D(nn.Module):
             nn.ReLU(True)
         )
 
-        # Mask Head
-        self.mask_head = spconv.SubMConv3d(self.hidden_dim, 1, kernel_size=1)
+        # Semantic Head: 输出 m 类 (包含背景类0)
+        self.semantic_head = spconv.SubMConv3d(self.hidden_dim, self.num_classes, kernel_size=1)
 
         # Param Head - 只在选中的voxel计算
         # 输出: [scale(3) + rotation(4) + features(num_features)]
@@ -231,6 +236,16 @@ class GaussianBackbone3D(nn.Module):
         # 可选：可学习的尺度偏置
         self.scale_bias = nn.Parameter(torch.zeros(3))
         
+        # Semantic MLP: 从 m 维类别概率提取 4 维 embedding
+        # 三层结构: Linear(m, 2m) -> ReLU -> Linear(2m, 2m) -> ReLU -> Linear(2m, 4)
+        self.semantic_mlp = nn.Sequential(
+            nn.Linear(self.num_classes, 2 * self.num_classes),
+            nn.ReLU(inplace=True),
+            nn.Linear(2 * self.num_classes, 2 * self.num_classes),
+            nn.ReLU(inplace=True),
+            nn.Linear(2 * self.num_classes, 4)
+        )
+        
         # 参数初始化
         self._init_weights()
 
@@ -238,9 +253,11 @@ class GaussianBackbone3D(nn.Module):
         print(f"  - Grid Size: {self.grid_size}")
         print(f"  - Feature Dim: {self.num_features}")
         print(f"  - Hidden Dim: {self.hidden_dim}")
+        print(f"  - Num Classes: {self.num_classes}")
         print(f"  - Max Gaussian Ratio: {self.max_gaussian_ratio}")
         print(f"  - Projection: {self.projection_method}")
-        print(f"  - Use Gumbel: {self.use_gumbel}")
+        if self.use_gumbel:
+            print(f"  - [Info] use_gumbel is currently not active; implement if needed.")
     
     def _init_weights(self):
         """初始化网络权重，提高训练稳定性"""
@@ -252,6 +269,10 @@ class GaussianBackbone3D(nn.Module):
             elif isinstance(m, spconv.SparseBatchNorm):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, batch_dict, agent=None, **kwargs):
         if agent is not None:
@@ -262,46 +283,59 @@ class GaussianBackbone3D(nn.Module):
             voxel_coords = batch_dict['voxel_coords']
 
         device = voxel_features.device
-        batch_size = voxel_coords[:, 0].max().int().item() + 1
+        
+        batch_size = 1
         spatial_shape = (self.grid_size[2], self.grid_size[1], self.grid_size[0])
-
         # step 1: SparseConv 编码
         x = spconv.SparseConvTensor(voxel_features, voxel_coords, spatial_shape, batch_size)
         encoded = self.encoder(x)  # encoded.features: [N_voxel, 128]
 
-        # step 2: Mask 预测
-        mask_logits = self.mask_head(encoded)
-        mask_prob = torch.sigmoid(mask_logits.features).squeeze(-1)  # [N_voxel]
+        # step 2: 语义分类预测
+        semantic_logits = self.semantic_head(encoded)  # SparseConvTensor
+        semantic_logits_dense = semantic_logits.features  # [N_voxel, num_classes]
+        semantic_probs = F.softmax(semantic_logits_dense, dim=-1)  # [N_voxel, num_classes] per-voxel class prob
         
         # 数值稳定性检查
-        if torch.isnan(mask_prob).any():
-            print("[Warning] NaN in mask_prob")
-            mask_prob = torch.where(torch.isnan(mask_prob), torch.zeros_like(mask_prob), mask_prob)
+        if torch.isnan(semantic_probs).any():
+            print("[Warning] NaN in semantic_probs")
+            semantic_probs = torch.where(torch.isnan(semantic_probs), torch.zeros_like(semantic_probs), semantic_probs)
         
-        # 监控mask分布（训练时）
+        # 监控语义分布（训练时）
         if self.training:
-            mask_mean = mask_prob.mean().item()
-            mask_std = mask_prob.std().item()
-            if mask_std < 0.01:
-                print(f"[Warning] Mask distribution collapsed: mean={mask_mean:.4f}, std={mask_std:.4f}")
+            cls_hist = semantic_probs.argmax(dim=-1).bincount(minlength=self.num_classes).float()
+            cls_ratio = (cls_hist / cls_hist.sum()).cpu().numpy()
+            print(f"[Semantic] class ratio: {cls_ratio}")
 
-        # step 3: 可微分的 Top-K 选择
-        N_total = mask_prob.shape[0]
+        # step 3: 基于语义预测的高斯选择策略（背景不过滤 + TopK）
+        N_total = semantic_probs.shape[0]
         K = max(1, int(self.max_gaussian_ratio * N_total))  # 稀疏度控制
+        # 定义前景得分：每个voxel在所有前景类别中的最大概率
+        # 背景类为index 0，前景类为 1..(num_classes - 1)
+        fg_probs = semantic_probs[:, 1:]  # [N_voxel, num_classes-1] 去掉背景列
+        fg_score, fg_class_idx_rel = fg_probs.max(dim=-1)  # [N_voxel] 前景最高概率 及 对应前景类索引(0..m-2)
+        fg_class_idx = fg_class_idx_rel + 1  # [N_voxel], 真实类别 1..m-1
         
-        if self.training and self.use_gumbel:
-            # 使用 Gumbel-Softmax 进行可微分选择
-            gumbel_noise = -torch.log(-torch.log(torch.rand_like(mask_prob) + 1e-6) + 1e-6)
-            soft_mask = F.softmax((mask_prob + gumbel_noise) / self.gumbel_temperature, dim=0)
-            selected_mask = (soft_mask > 1e-3).float()
-            topk_prob = (soft_mask * selected_mask).sum().unsqueeze(0)
-            sel_idx = torch.nonzero(selected_mask.squeeze(), as_tuple=False).squeeze()
-            if len(sel_idx.shape) == 0:
-                sel_idx = sel_idx.unsqueeze(0)
+        # 背景voxel判定：argmax类别是0的为背景
+        pred_class = semantic_probs.argmax(dim=-1)  # [N_voxel]
+        is_foreground = (pred_class != 0)  # True 表示非背景
+        
+        # 过滤出前景voxel
+        candidate_idx_raw = torch.nonzero(is_foreground, as_tuple=False)  # [N_candidate, 1]
+        if candidate_idx_raw.numel() > 0:
+            candidate_idx = candidate_idx_raw.squeeze(-1)  # [N_candidate]
         else:
-            # 硬TopK选择（推理或非Gumbel模式）
-            topk_prob, topk_idx = torch.topk(mask_prob, min(K, N_total))
+            candidate_idx = torch.tensor([], dtype=torch.long, device=device)  # 空tensor
+        
+        if candidate_idx.numel() == 0:
+            # fallback: 所有voxel中选fg_score最大的K个
+            topk_score, topk_idx = torch.topk(fg_score, min(K, N_total))
             sel_idx = topk_idx
+        else:
+            candidate_scores = fg_score[candidate_idx]
+            num_candidate = candidate_idx.numel()
+            topk_num = min(K, num_candidate)
+            topk_score, topk_rel_idx = torch.topk(candidate_scores, topk_num)
+            sel_idx = candidate_idx[topk_rel_idx]
 
         # step 4: 只为选中的voxel计算参数（节省显存）
         sel_coords = encoded.indices[sel_idx]  # [K, 4]
@@ -327,12 +361,17 @@ class GaussianBackbone3D(nn.Module):
         # 计算 μ 世界坐标
         μ_world = self._coords_to_world_no_offset(sel_coords)
 
-        # step 5: 组织输出
+        # step 5: 为选中的voxel计算语义embedding
+        sel_semantic_probs = semantic_probs[sel_idx]  # [K, num_classes]
+        semantic_embed = self.semantic_mlp(sel_semantic_probs)  # [K, 4]
+
+        # step 6: 组织输出
         gaussians = {
             'mu': μ_world,
             'scale': s_param,
             'rotation': r_param,
-            'features': Q_param
+            'features': Q_param,
+            'semantic': semantic_embed  # [K, 4]
         }
 
         if agent is not None:
@@ -340,7 +379,7 @@ class GaussianBackbone3D(nn.Module):
         else:
             batch_dict['lidar_gaussians'] = gaussians
 
-        # step 6: 优化的TPV投影
+        # step 7: 优化的TPV投影
         tpv_xy = self._project_to_plane_optimized(voxel_features, voxel_coords, 'xy', device, batch_size)
         tpv_xz = self._project_to_plane_optimized(voxel_features, voxel_coords, 'xz', device, batch_size)
         tpv_yz = self._project_to_plane_optimized(voxel_features, voxel_coords, 'yz', device, batch_size)
@@ -493,23 +532,23 @@ class Gaussian3DBackbone(nn.Module):
         self.vfe = DynamicVoxelVFE(
             model_cfg=vfe_cfg,
             num_point_features=num_point_features,
-            voxel_size=voxel_size,
-            grid_size=grid_size,
-            point_cloud_range=point_cloud_range
+            voxel_size=self.voxel_size,
+            grid_size=self.grid_size,
+            point_cloud_range=self.point_cloud_range
         )
         
         # Backbone初始化
         self.backbone = GaussianBackbone3D(
             model_cfg=backbone_cfg,
-            grid_size=grid_size,
-            voxel_size=voxel_size,
-            point_cloud_range=point_cloud_range
+            grid_size=self.grid_size,
+            voxel_size=self.voxel_size,
+            point_cloud_range=self.point_cloud_range
         )
         
         print(f"[Gaussian3DBackbone] 初始化完成:")
         print(f"  - VFE Filters: {vfe_cfg['NUM_FILTERS']}")
         print(f"  - Backbone Features: {backbone_cfg.get('NUM_FEATURES', 128)}")
-        print(f"  - Grid Size: {grid_size}")
+        print(f"  - Grid Size: {self.grid_size}")
     
     def forward(self, batch_dict, agent=None, **kwargs):
         """

@@ -5,7 +5,7 @@ form gaussian_modules import refiner
 import torch.profiler
 import torch.nn.functional as F
 from easydict import EasyDict
-
+import torch.nn as nn
 
 class Airv2xGaussian(Detector3DTemplate):
     def __init__(self, model_cfg, dataset, num_class=7):
@@ -33,10 +33,15 @@ class Airv2xGaussian(Detector3DTemplate):
         num_anchors = 2
         num_classes = 7
         C = 512
+        self.num_classes = num_class
         self.cls_head = torch.nn.Conv2d(C, num_anchors * num_classes, kernel_size=1)
         self.reg_head = torch.nn.Conv2d(C, 7 * num_anchors, kernel_size=1)
         self.obj_head = torch.nn.Conv2d(C, num_anchors, kernel_size=1)
-        
+        self.semantic_head = nn.Sequential(
+            nn.Linear(self.num_classes, 2 * self.num_classes),
+            nn.ReLU(inplace=True),
+            nn.Linear(2 * self.num_classes, 4)
+        )#TODO
         # 构建网络模块
         self.module_list = self.build_networks()
         self.time_list = []
@@ -204,6 +209,7 @@ class Airv2xGaussian(Detector3DTemplate):
         print("available_agents:", available_agents)
         
         # 按照模块拓扑结构执行前向传播
+        #考虑将backbone2d和backbone3d 的semantic模块合并 TODO
         for cur_module, model_name in zip(self.module_list, self.module_topology):
             if cur_module is not None:
                 if model_name == 'backbone3d':
@@ -216,8 +222,10 @@ class Airv2xGaussian(Detector3DTemplate):
                 elif model_name in ['construct_TPV', 'gaussian_update', 'map_to_TPV']:
                     # 这些模块处理多agent融合
                     batch_dict = cur_module(batch_dict, available_agents)
+                elif model_name == 'backbone2d':
+                    # 其他模块不需要agent参数 backbone2d
+                    batch_dict = cur_module(batch_dict)
                 else:
-                    # 其他模块不需要agent参数
                     batch_dict = cur_module(batch_dict)
 
         # 输出BEV特征格式
