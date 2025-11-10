@@ -130,6 +130,7 @@ class ContinuousGaussianVFE(nn.Module):
         sc   = gaussians["scale"]
         rot  = gaussians["rotation"]
         feat = gaussians["features"]
+        semantic = gaussians["semantic"]
         bidx = gaussians.get("batch_idx", torch.zeros(mu.size(0), device=mu.device, dtype=torch.long))
 
         # 1) 连续 → 离散体素索引
@@ -143,7 +144,7 @@ class ContinuousGaussianVFE(nn.Module):
             empty_voxel_coords = voxel_bzyx.new_zeros((0, 4))
             return empty, empty_voxel_coords
 
-        mu, sc, rot, feat, voxel_bzyx = mu[valid], sc[valid], rot[valid], feat[valid], voxel_bzyx[valid]
+        mu, sc, rot, feat, semantic, voxel_bzyx = mu[valid], sc[valid], rot[valid], feat[valid], semantic[valid], voxel_bzyx[valid]
 
         # 2) 分组（同一 voxel 的点归为一组）
         code = self._group_code(voxel_bzyx)                        # [N]
@@ -155,11 +156,12 @@ class ContinuousGaussianVFE(nn.Module):
             mu_out   = torch_scatter.scatter_mean(mu,   inv, dim=0)        # [M,3]
             sc_out   = torch_scatter.scatter_mean(sc,   inv, dim=0)        # [M,3]
             feat_out = torch_scatter.scatter_mean(feat, inv, dim=0)        # [M,C]
+            semantic_out = torch_scatter.scatter_mean(semantic, inv, dim=0)        # [M,2]
         else:
             mu_out   = torch_scatter.scatter_add(mu,   inv, dim=0) / torch_scatter.scatter_add(torch.ones_like(mu[:, :1]), inv, dim=0)
             sc_out   = torch_scatter.scatter_add(sc,   inv, dim=0) / torch_scatter.scatter_add(torch.ones_like(sc[:, :1]), inv, dim=0)
-            feat_out = torch_scatter.scatter_add(feat, inv, dim=0)
-
+            feat_out = torch_scatter.scatter_add(feat, inv, dim=0)  
+            semantic_out = torch_scatter.scatter_add(semantic, inv, dim=0) / torch_scatter.scatter_add(torch.ones_like(semantic[:, :1]), inv, dim=0)
         rot_out = self._quat_pool(rot, inv)                                  # [M,4]
 
         # 4) 还原整数体素坐标 (b,z,y,x) 供 BEV 使用
@@ -173,7 +175,7 @@ class ContinuousGaussianVFE(nn.Module):
         voxel_coords = torch.stack([vb, vz, vy, vx], dim=1)                  # [M,4]
         
         gaussians = dict(
-            mu=mu_out, scale=sc_out, rotation=rot_out, features=feat_out,
+            mu=mu_out, scale=sc_out, rotation=rot_out, features=feat_out, semantic=semantic_out,
         )                 # 连续高度（可用于额外监督/可视化）
 
         return gaussians,voxel_coords
@@ -218,6 +220,7 @@ class GaussianMixtureAccumulator(nn.Module):
         sc   = pooled_gaussians['scale'   ].to(device)  # [N,3]
         feat = pooled_gaussians['features'].to(device)  # [N,C]
         rot  = pooled_gaussians['rotation'].to(device)  # [N,4]
+        semantic = pooled_gaussians['semantic'].to(device)  # [N,4]
 
         M, N = query_points.size(0), mu.size(0)
         out_feats = torch.zeros((M, feat.size(1)), device=device)
@@ -240,6 +243,7 @@ class GaussianMixtureAccumulator(nn.Module):
                 mu_nb = mu[safe_idx]          # [M,K,3]
                 sc_nb = sc[safe_idx]          # [M,K,3]
                 ft_nb = feat[safe_idx]        # [M,K,C]
+                semantic_nb = semantic[safe_idx]        # [M,K,4]
                 R_nb  = R[safe_idx] if self.use_mahalanobis else None
 
                 q = query_points[:, None, :]  # [M,1,3]
@@ -251,6 +255,7 @@ class GaussianMixtureAccumulator(nn.Module):
                     w = w / denom
 
                 out_feats = torch.einsum('mk,mkc->mc', w, ft_nb)  # [M,C]
+                out_semantic = torch.einsum('mk,mk4->m4', w, semantic_nb)  # [M,4]
                 out_weights = w  # 暴露混合权重，便于可视化/调试
 
                 # 注意：这里不立刻 return，允许后续逻辑根据需要继续处理或做一致化
@@ -268,7 +273,7 @@ class GaussianMixtureAccumulator(nn.Module):
             out_weights = None  # dense 路径不返回 K 维权重
 
         # ========== 统一返回 ==========
-        return out_feats, out_weights
+        return out_feats, out_semantic, out_weights
 
     # ---------- 内联工具：距离/旋转 ----------
     @staticmethod
@@ -445,7 +450,7 @@ class BEVScatterWithHeight(nn.Module):
         grid_size: Tuple[int, int, int],   # (H, W, D)
         aggregation_method: str = 'mean',  # 'mean' | 'sum' | 'max'
         z_bins: int = 16, #设置和z grid一样就行
-        height_embed_dim: int = 32, #和最终的feature一样维度
+        height_embed_dim: int = 32, #和最终的feature一样维度 (128 + 4) #TODO
         fuse_mode: str = 'concat',         # 'concat' | 'add'
     ):
         super().__init__()
@@ -455,7 +460,7 @@ class BEVScatterWithHeight(nn.Module):
         self.H, self.W, self.D = grid_size
         self.aggregation_method = aggregation_method
         self.z_bins = z_bins
-        self.height_embed_dim = height_embed_dim
+        self.height_embed_dim = height_embed_dim 
         self.fuse_mode = fuse_mode
 
         # z-bins → 高度 embedding
@@ -469,12 +474,12 @@ class BEVScatterWithHeight(nn.Module):
 
     def forward(
         self,
-        voxel_features: torch.Tensor,   # [M, C]
+        features: torch.Tensor,   # [M, C]
         voxel_coords: torch.Tensor      # [M, 4] = (b,z,y,x)
     ) -> torch.Tensor:
-        device = voxel_features.device
-        dtype  = voxel_features.dtype
-        M, C = voxel_features.shape
+        device = features.device
+        dtype  = features.dtype
+        M, C = features.shape
 
         if voxel_coords.numel() == 0 or M == 0:
             # 空输入兜底
@@ -498,14 +503,14 @@ class BEVScatterWithHeight(nn.Module):
 
         # ---------- 2) Z 方向聚合到 BEV ----------
         if self.aggregation_method == 'mean':
-            bev_feat = scatter_mean(voxel_features, code_bev, dim=0, dim_size=B * HW)    # [B*H*W, C]
+            bev_feat = scatter_mean(features, code_bev, dim=0, dim_size=B * HW)    # [B*H*W, C + 4]
         elif self.aggregation_method == 'sum':
-            bev_feat = scatter_add (voxel_features, code_bev, dim=0, dim_size=B * HW)    # [B*H*W, C]
+            bev_feat = scatter_add (features, code_bev, dim=0, dim_size=B * HW)    # [B*H*W, C + 4]
         else:  # 'max'
             # scatter_max 返回 (values, indices)
-            bev_feat, _ = scatter_max(voxel_features, code_bev, dim=0, dim_size=B * HW)  # [B*H*W, C]
+            bev_feat, _ = scatter_max(features, code_bev, dim=0, dim_size=B * HW)  # [B*H*W, C + 4]
 
-        bev_feat = bev_feat.view(B, self.H, self.W, C).permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
+        bev_feat = bev_feat.view(B, self.H, self.W, C).permute(0, 3, 1, 2).contiguous()  # [B, C + 4, H, W]
 
         # ---------- 3) 构建 z-bins 高度 one-hot ----------
         # 若 z_bins 与 D 不同，把 z 映射到 bin：bin = floor(z * z_bins / D)
@@ -550,7 +555,7 @@ class BEVFeatureRefiner(nn.Module):
     简单三层 CNN refine BEV 特征图
     输入输出维度相同，用 ReLU 激活
     """
-    def __init__(self, in_channels: int):
+    def __init__(self, in_channels: int): #TODO channels 是image 和 semantic concat
         super().__init__()
         self.refinement_layers = nn.Sequential(
             nn.Conv2d(in_channels, 3*in_channels, kernel_size=3, padding=1),
@@ -701,19 +706,20 @@ class GaussianToBEV(nn.Module):
             voxel_centers = self._voxel_centers_from_coords(voxel_coords)
 
         # 3) 在 voxel 中心处做高斯混合累加得到体素特征
-        voxel_features, mix_weights = self.mixture_accumulator(
+        voxel_features, out_semantic, mix_weights = self.mixture_accumulator(
             pooled_gaussians=pooled_gaussians,
             query_points=voxel_centers,
             voxel_coords=voxel_coords,
             neighbor_info=neighbor_info
         )
-        intermediates['voxel_features'] = voxel_features
+        features = torch.cat([voxel_features, out_semantic], dim=1) # [M, C + 4]
+        intermediates['features'] = features
         if mix_weights is not None:
             intermediates['mixture_weights'] = mix_weights
 
         # 4) 压到 BEV + 高度 one-hot 嵌入融合
         bev_features = self.bev_scatter(
-            voxel_features=voxel_features,
+            voxel_features=features,
             voxel_coords=voxel_coords
         )  # [B, C_bev, H, W]
         intermediates['bev_raw'] = bev_features
